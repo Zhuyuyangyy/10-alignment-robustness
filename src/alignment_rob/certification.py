@@ -315,21 +315,31 @@ class RandomizedSmoothing:
     def _binomial_confidence(self, k: int, n: int) -> float:
         """Compute lower bound of binomial confidence interval.
 
-        Uses the Clopper-Pearson method.
+        Uses the Clopper-Pearson (exact) method via the beta distribution.
+
+        The lower bound is: Beta(alpha/2; k, n - k + 1)
 
         Args:
-            k: Number of successes.
-            n: Number of trials.
+            k: Number of successes (top class count).
+            n: Number of trials (total samples).
 
         Returns:
-            Lower bound of the confidence interval.
+            Lower bound of the confidence interval for p_A.
         """
+        if k == 0:
+            return 0.0
+        if k == n:
+            return 1.0
+
         try:
-            from scipy.stats import binom
-            return binom.ppf(1 - self.config.alpha, n, k / n) / n
+            from scipy.stats import beta as beta_dist
+            return float(beta_dist.ppf(self.config.alpha / 2, k, n - k + 1))
         except ImportError:
-            # Fallback to simple approximation
-            return k / n
+            # Fallback: Wald interval (less accurate but no scipy needed)
+            p_hat = k / n
+            z = 2.576  # 99% CI approximation
+            se = (p_hat * (1 - p_hat) / n) ** 0.5
+            return max(0.0, p_hat - z * se)
 
     def certify_batch(
         self,

@@ -4,14 +4,19 @@ This module provides metrics for evaluating the robustness of
 aligned models against adversarial attacks.
 """
 
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
+
 import numpy as np
-from typing import List, Dict, Optional, Any
-from dataclasses import dataclass, field
+
+from alignment_rob.attacks import AttackResult
 
 
 @dataclass
-class RobustnessMetrics:
-    """Comprehensive robustness metrics.
+class EvaluationSummary:
+    """Comprehensive robustness evaluation summary.
 
     Attributes:
         asr: Attack Success Rate.
@@ -20,35 +25,12 @@ class RobustnessMetrics:
         average_score: Average score across attacks.
         stability_score: Stability of alignment under perturbation.
     """
+
     asr: float = 0.0
     certified_radius: float = 0.0
     worst_case_score: float = 0.0
     average_score: float = 0.0
     stability_score: float = 0.0
-
-
-@dataclass
-class AttackResult:
-    """Result of an adversarial attack.
-
-    Attributes:
-        attack_name: Name of the attack.
-        success: Whether the attack was successful.
-        original_prompt: Original prompt.
-        adversarial_prompt: Adversarial prompt found.
-        original_response: Original model response.
-        adversarial_response: Model response to adversarial prompt.
-        num_queries: Number of queries used.
-        perturbation_size: Size of perturbation.
-    """
-    attack_name: str
-    success: bool
-    original_prompt: str = ""
-    adversarial_prompt: str = ""
-    original_response: str = ""
-    adversarial_response: str = ""
-    num_queries: int = 0
-    perturbation_size: float = 0.0
 
 
 class RobustnessEvaluator:
@@ -66,95 +48,70 @@ class RobustnessEvaluator:
         self,
         model: Any,
         attacks: Optional[List[Any]] = None,
-    ):
+    ) -> None:
         self.model = model
         self.attacks = attacks or []
 
     def evaluate(
         self,
         attack_results: List[AttackResult],
-    ) -> RobustnessMetrics:
+    ) -> EvaluationSummary:
         """Evaluate robustness from attack results.
 
         Args:
             attack_results: List of attack results.
 
         Returns:
-            RobustnessMetrics object.
+            EvaluationSummary object.
         """
         if not attack_results:
-            return RobustnessMetrics()
+            return EvaluationSummary()
 
-        # Compute Attack Success Rate
         asr = sum(1 for r in attack_results if r.success) / len(attack_results)
 
-        # Compute other metrics
-        perturbation_sizes = [r.perturbation_size for r in attack_results]
-        query_counts = [r.num_queries for r in attack_results]
-
-        return RobustnessMetrics(
+        return EvaluationSummary(
             asr=asr,
             certified_radius=self._estimate_certified_radius(attack_results),
-            worst_case_score=1 - asr,
-            average_score=1 - asr,
-            stability_score=self._compute_stability(attack_results),
+            worst_case_score=1.0 - asr,
+            average_score=1.0 - asr,
+            stability_score=1.0 - asr,
         )
 
+    @staticmethod
     def _estimate_certified_radius(
-        self,
         attack_results: List[AttackResult],
     ) -> float:
-        """Estimate certified robust radius.
+        """Estimate certified robust radius from successful attack perturbation sizes.
 
         Args:
             attack_results: List of attack results.
 
         Returns:
-            Estimated certified radius.
+            Estimated certified radius (half of minimum successful perturbation).
         """
-        # Simple estimation based on perturbation sizes
         successful = [r for r in attack_results if r.success]
         if not successful:
             return float("inf")
 
         min_perturbation = min(r.perturbation_size for r in successful)
-        return min_perturbation / 2
-
-    def _compute_stability(
-        self,
-        attack_results: List[AttackResult],
-    ) -> float:
-        """Compute stability score.
-
-        Args:
-            attack_results: List of attack results.
-
-        Returns:
-            Stability score (0-1).
-        """
-        if not attack_results:
-            return 1.0
-
-        # Stability = 1 - ASR
-        asr = sum(1 for r in attack_results if r.success) / len(attack_results)
-        return 1 - asr
+        return min_perturbation / 2.0
 
     def compare_methods(
         self,
         results_dict: Dict[str, List[AttackResult]],
-    ) -> Dict[str, RobustnessMetrics]:
+    ) -> Dict[str, EvaluationSummary]:
         """Compare robustness across alignment methods.
 
         Args:
             results_dict: Dictionary mapping method names to attack results.
 
         Returns:
-            Dictionary mapping method names to robustness metrics.
+            Dictionary mapping method names to evaluation summaries.
         """
-        comparison = {}
-        for method_name, results in results_dict.items():
-            comparison[method_name] = self.evaluate(results)
-        return comparison
+        return {
+            method_name: self.evaluate(results)
+            for method_name, results in results_dict.items()
+        }
 
 
 class ASRMetric:
@@ -163,14 +120,15 @@ class ASRMetric:
     Computes the fraction of successful attacks.
     """
 
-    def compute(self, results: List[AttackResult]) -> float:
+    @staticmethod
+    def compute(results: List[AttackResult]) -> float:
         """Compute ASR.
 
         Args:
             results: List of attack results.
 
         Returns:
-            Attack Success Rate.
+            Attack Success Rate (0.0 if no results).
         """
         if not results:
             return 0.0
@@ -183,8 +141,8 @@ class CertifiedRadiusMetric:
     Computes the certified radius using randomized smoothing.
     """
 
+    @staticmethod
     def compute(
-        self,
         results: List[AttackResult],
         sigma: float = 0.5,
         alpha: float = 0.05,
@@ -197,9 +155,8 @@ class CertifiedRadiusMetric:
             alpha: Confidence level.
 
         Returns:
-            Certified radius.
+            Certified radius (inf if no successful attacks).
         """
-        # Simple estimation
         successful = [r for r in results if r.success]
         if not successful:
             return float("inf")
@@ -214,25 +171,26 @@ class PerturbationSizeMetric:
     Measures the size of adversarial perturbations.
     """
 
-    def compute(self, results: List[AttackResult]) -> Dict[str, float]:
+    @staticmethod
+    def compute(results: List[AttackResult]) -> Dict[str, float]:
         """Compute perturbation size statistics.
 
         Args:
             results: List of attack results.
 
         Returns:
-            Dictionary with perturbation size statistics.
+            Dictionary with perturbation size statistics (mean, std, min, max).
         """
         if not results:
-            return {"mean": 0, "std": 0, "min": 0, "max": 0}
+            return {"mean": 0.0, "std": 0.0, "min": 0.0, "max": 0.0}
 
-        sizes = [r.perturbation_size for r in results]
+        sizes = np.array([r.perturbation_size for r in results])
 
         return {
-            "mean": np.mean(sizes),
-            "std": np.std(sizes),
-            "min": np.min(sizes),
-            "max": np.max(sizes),
+            "mean": float(np.mean(sizes)),
+            "std": float(np.std(sizes)),
+            "min": float(np.min(sizes)),
+            "max": float(np.max(sizes)),
         }
 
 
@@ -242,24 +200,30 @@ class QueryEfficiencyMetric:
     Measures the number of queries needed for successful attacks.
     """
 
-    def compute(self, results: List[AttackResult]) -> Dict[str, float]:
+    @staticmethod
+    def compute(results: List[AttackResult]) -> Dict[str, float]:
         """Compute query efficiency statistics.
 
         Args:
             results: List of attack results.
 
         Returns:
-            Dictionary with query efficiency statistics.
+            Dictionary with query efficiency statistics (mean, std, min, max).
         """
         successful = [r for r in results if r.success]
         if not successful:
-            return {"mean": float("inf"), "std": 0, "min": float("inf"), "max": float("inf")}
+            return {
+                "mean": float("inf"),
+                "std": 0.0,
+                "min": float("inf"),
+                "max": float("inf"),
+            }
 
-        queries = [r.num_queries for r in successful]
+        queries = np.array([r.num_queries for r in successful])
 
         return {
-            "mean": np.mean(queries),
-            "std": np.std(queries),
-            "min": np.min(queries),
-            "max": np.max(queries),
+            "mean": float(np.mean(queries)),
+            "std": float(np.std(queries)),
+            "min": float(np.min(queries)),
+            "max": float(np.max(queries)),
         }

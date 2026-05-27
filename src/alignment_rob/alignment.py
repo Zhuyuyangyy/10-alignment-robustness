@@ -26,14 +26,16 @@ Reference:
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
-from torch.optim import AdamW
+from torch.optim import AdamW, Optimizer
+
+_DEFAULT_DELTA = 0.05
 
 
 @dataclass
@@ -53,6 +55,7 @@ class AlignmentConfig:
         clip_range: PPO clipping range.
         use_wandb: Whether to log to Weights & Biases.
     """
+
     beta: float = 0.1
     learning_rate: float = 1e-6
     num_epochs: int = 1
@@ -79,6 +82,7 @@ class AlignmentResult:
         num_steps: Total training steps.
         robustness_bound: Theoretical robustness bound.
     """
+
     final_reward: float = 0.0
     kl_divergence: float = 0.0
     safety_score: float = 0.0
@@ -98,6 +102,27 @@ class AlignmentResult:
             "num_steps": self.num_steps,
             "robustness_bound": self.robustness_bound,
         }
+
+
+def _step_optimizer(
+    optimizer: Optimizer,
+    model: nn.Module,
+    loss: Tensor,
+    step: int,
+    config: AlignmentConfig,
+) -> None:
+    """Backward pass with gradient accumulation and clipping.
+
+    Handles the common pattern of:
+    1. loss.backward()
+    2. Clip gradients every gradient_accumulation_steps
+    3. optimizer.step() + zero_grad()
+    """
+    loss.backward()
+    if (step + 1) % config.gradient_accumulation_steps == 0:
+        torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
+        optimizer.step()
+        optimizer.zero_grad()
 
 
 class BaseAlignment(ABC):
@@ -144,7 +169,30 @@ class BaseAlignment(ABC):
         Returns:
             Lower bound on robustness.
         """
-        return 1.0 - 0.05 - self.config.beta * kl_divergence
+        return 1.0 - _DEFAULT_DELTA - self.config.beta * kl_divergence
+
+    @staticmethod
+    def compute_logps(model: nn.Module, input_ids: Tensor) -> Tensor:
+        """Compute log probabilities for sequences.
+
+        Shared implementation used by DPO and KTO.
+
+        Args:
+            model: The model.
+            input_ids: Input token IDs of shape (batch, seq_len).
+
+        Returns:
+            Log probability of each sequence, shape (batch,).
+        """
+        outputs = model(input_ids=input_ids)
+        logps = outputs.logits.log_softmax(-1)
+
+        # Gather log probs for selected tokens (autoregressive shift)
+        tokens = input_ids[:, 1:]
+        logps = logps[:, :-1]
+        token_logps = logps.gather(-1, tokens.unsqueeze(-1)).squeeze(-1)
+
+        return token_logps.sum(-1)
 
 
 class RLHF(BaseAlignment):
@@ -199,9 +247,8 @@ class RLHF(BaseAlignment):
         model.train()
         ref_model.eval()
 
-        for epoch in range(self.config.num_epochs):
+        for _epoch in range(self.config.num_epochs):
             for batch in data:
-                # Generate responses
                 prompts = batch.get("input_ids")
                 if prompts is None:
                     continue
@@ -210,14 +257,12 @@ class RLHF(BaseAlignment):
                     ref_outputs = ref_model(**batch)
                     ref_logprobs = ref_outputs.logits.log_softmax(-1)
 
-                # Forward pass
                 outputs = model(**batch)
                 logprobs = outputs.logits.log_softmax(-1)
 
-                # Compute rewards (from reward model or heuristic)
                 rewards = batch.get("rewards", torch.zeros(1))
 
-                # Compute KL divergence
+                # KL divergence
                 kl = (logprobs.exp() * (logprobs - ref_logprobs)).sum(-1).mean()
 
                 # PPO clipped objective
@@ -225,36 +270,31 @@ class RLHF(BaseAlignment):
                 ratio = (logprobs - ref_logprobs).exp()
                 clipped_ratio = ratio.clamp(
                     1 - self.config.clip_range,
-                    1 + self.config.clip_range
+                    1 + self.config.clip_range,
                 )
 
-                # Policy loss
                 policy_loss = -torch.min(
                     ratio * advantages,
-                    clipped_ratio * advantages
+                    clipped_ratio * advantages,
                 ).mean()
 
-                # KL penalty
-                kl_penalty = self.config.beta * kl
+                loss = policy_loss + self.config.beta * kl
 
-                # Total loss
-                loss = policy_loss + kl_penalty
-
-                # Backward pass
-                loss.backward()
-                if (num_steps + 1) % self.config.gradient_accumulation_steps == 0:
-                    torch.nn.utils.clip_grad_norm_(
-                        model.parameters(), self.config.max_grad_norm
-                    )
-                    optimizer.step()
-                    optimizer.zero_grad()
+                _step_optimizer(optimizer, model, loss, num_steps, self.config)
 
                 total_reward += rewards.mean().item()
                 total_kl += kl.item()
                 total_loss += loss.item()
                 num_steps += 1
 
-        # Compute robustness bound
+        # Flush remaining gradients
+        if num_steps % self.config.gradient_accumulation_steps != 0:
+            torch.nn.utils.clip_grad_norm_(
+                model.parameters(), self.config.max_grad_norm
+            )
+            optimizer.step()
+            optimizer.zero_grad()
+
         avg_kl = total_kl / max(num_steps, 1)
         robustness_bound = self.compute_robustness_bound(avg_kl)
 
@@ -274,9 +314,8 @@ class RLHF(BaseAlignment):
             kl: KL divergence tensor.
 
         Returns:
-            Advantage tensor.
+            Normalized advantage tensor.
         """
-        # Simplified GAE
         advantages = rewards - self.config.beta * kl
         return (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
@@ -336,49 +375,45 @@ class DPO(BaseAlignment):
         model.train()
         ref_model.eval()
 
-        for epoch in range(self.config.num_epochs):
+        for _epoch in range(self.config.num_epochs):
             for batch in data:
-                # Extract preference pairs
                 chosen_ids = batch.get("chosen_ids")
                 rejected_ids = batch.get("rejected_ids")
 
                 if chosen_ids is None or rejected_ids is None:
                     continue
 
-                # Compute log probabilities
-                chosen_logps = self._compute_logps(model, chosen_ids)
-                rejected_logps = self._compute_logps(model, rejected_ids)
+                chosen_logps = self.compute_logps(model, chosen_ids)
+                rejected_logps = self.compute_logps(model, rejected_ids)
 
                 with torch.no_grad():
-                    ref_chosen_logps = self._compute_logps(ref_model, chosen_ids)
-                    ref_rejected_logps = self._compute_logps(ref_model, rejected_ids)
+                    ref_chosen_logps = self.compute_logps(ref_model, chosen_ids)
+                    ref_rejected_logps = self.compute_logps(ref_model, rejected_ids)
 
-                # DPO loss
                 chosen_rewards = self.config.beta * (chosen_logps - ref_chosen_logps)
-                rejected_rewards = self.config.beta * (rejected_logps - ref_rejected_logps)
+                rejected_rewards = self.config.beta * (
+                    rejected_logps - ref_rejected_logps
+                )
 
                 loss = -F.logsigmoid(chosen_rewards - rejected_rewards).mean()
 
-                # Backward pass
-                loss.backward()
-                if (num_steps + 1) % self.config.gradient_accumulation_steps == 0:
-                    torch.nn.utils.clip_grad_norm_(
-                        model.parameters(), self.config.max_grad_norm
-                    )
-                    optimizer.step()
-                    optimizer.zero_grad()
+                _step_optimizer(optimizer, model, loss, num_steps, self.config)
 
-                # Compute accuracy
                 accuracy = (chosen_rewards > rejected_rewards).float().mean()
-
                 total_loss += loss.item()
                 total_accuracy += accuracy.item()
                 num_steps += 1
 
-        # Compute robustness bound (DPO-specific)
+        # Flush remaining gradients
+        if num_steps % self.config.gradient_accumulation_steps != 0:
+            torch.nn.utils.clip_grad_norm_(
+                model.parameters(), self.config.max_grad_norm
+            )
+            optimizer.step()
+            optimizer.zero_grad()
+
         avg_loss = total_loss / max(num_steps, 1)
-        # DPO bound: Rob(DPO) >= 1 - delta - O(1/sqrt(N))
-        robustness_bound = 1.0 - 0.05 - 1.0 / (len(data) ** 0.5)
+        robustness_bound = 1.0 - _DEFAULT_DELTA - 1.0 / (len(data) ** 0.5)
 
         return AlignmentResult(
             final_reward=total_accuracy / max(num_steps, 1),
@@ -387,26 +422,6 @@ class DPO(BaseAlignment):
             num_steps=num_steps,
             robustness_bound=robustness_bound,
         )
-
-    def _compute_logps(self, model: nn.Module, input_ids: Tensor) -> Tensor:
-        """Compute log probabilities for sequences.
-
-        Args:
-            model: The model.
-            input_ids: Input token IDs.
-
-        Returns:
-            Log probability of each sequence.
-        """
-        outputs = model(input_ids=input_ids)
-        logps = outputs.logits.log_softmax(-1)
-
-        # Gather log probs for selected tokens
-        tokens = input_ids[:, 1:]
-        logps = logps[:, :-1]
-        token_logps = logps.gather(-1, tokens.unsqueeze(-1)).squeeze(-1)
-
-        return token_logps.sum(-1)
 
 
 class KTO(BaseAlignment):
@@ -469,7 +484,7 @@ class KTO(BaseAlignment):
         model.train()
         ref_model.eval()
 
-        for epoch in range(self.config.num_epochs):
+        for _epoch in range(self.config.num_epochs):
             for batch in data:
                 input_ids = batch.get("input_ids")
                 is_desirable = batch.get("is_desirable")
@@ -477,16 +492,13 @@ class KTO(BaseAlignment):
                 if input_ids is None:
                     continue
 
-                # Compute log probabilities
-                model_logps = self._compute_logps(model, input_ids)
+                model_logps = self.compute_logps(model, input_ids)
 
                 with torch.no_grad():
-                    ref_logps = self._compute_logps(ref_model, input_ids)
+                    ref_logps = self.compute_logps(ref_model, input_ids)
 
-                # KTO loss
                 log_ratio = model_logps - ref_logps
 
-                # Apply prospect theory weighting
                 if is_desirable is not None:
                     weights = torch.where(
                         is_desirable.bool(),
@@ -496,25 +508,25 @@ class KTO(BaseAlignment):
                 else:
                     weights = torch.ones_like(log_ratio)
 
-                # KTO objective: minimize loss aversion weighted loss
-                loss = (weights * (1 - torch.sigmoid(self.config.beta * log_ratio))).mean()
+                loss = (
+                    weights * (1 - torch.sigmoid(self.config.beta * log_ratio))
+                ).mean()
 
-                # Backward pass
-                loss.backward()
-                if (num_steps + 1) % self.config.gradient_accumulation_steps == 0:
-                    torch.nn.utils.clip_grad_norm_(
-                        model.parameters(), self.config.max_grad_norm
-                    )
-                    optimizer.step()
-                    optimizer.zero_grad()
+                _step_optimizer(optimizer, model, loss, num_steps, self.config)
 
                 total_loss += loss.item()
                 num_steps += 1
 
-        # Compute robustness bound
+        # Flush remaining gradients
+        if num_steps % self.config.gradient_accumulation_steps != 0:
+            torch.nn.utils.clip_grad_norm_(
+                model.parameters(), self.config.max_grad_norm
+            )
+            optimizer.step()
+            optimizer.zero_grad()
+
         avg_loss = total_loss / max(num_steps, 1)
-        # KTO bound similar to DPO but with loss aversion adjustment
-        robustness_bound = 1.0 - 0.05 - 0.5 / (len(data) ** 0.5)
+        robustness_bound = 1.0 - _DEFAULT_DELTA - 0.5 / (len(data) ** 0.5)
 
         return AlignmentResult(
             final_reward=1.0 - avg_loss,
@@ -523,22 +535,3 @@ class KTO(BaseAlignment):
             num_steps=num_steps,
             robustness_bound=robustness_bound,
         )
-
-    def _compute_logps(self, model: nn.Module, input_ids: Tensor) -> Tensor:
-        """Compute log probabilities for sequences.
-
-        Args:
-            model: The model.
-            input_ids: Input token IDs.
-
-        Returns:
-            Log probability of each sequence.
-        """
-        outputs = model(input_ids=input_ids)
-        logps = outputs.logits.log_softmax(-1)
-
-        tokens = input_ids[:, 1:]
-        logps = logps[:, :-1]
-        token_logps = logps.gather(-1, tokens.unsqueeze(-1)).squeeze(-1)
-
-        return token_logps.sum(-1)
